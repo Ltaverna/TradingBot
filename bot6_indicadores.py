@@ -122,6 +122,19 @@ class TradingBot:
         except Exception as e:
             logging.error(f"Error saving trade: {e}")
 
+    def get_today_trades(self):
+        try:
+            today = datetime.now().date().isoformat()  # Obtener la fecha local de hoy
+            with sqlite3.connect("trades.db") as conn:
+                c = conn.cursor()
+                # Count both 'buy' and 'sell' trades for the day
+                c.execute("SELECT COUNT(*) FROM trades WHERE trade_date = ? AND (side = 'buy' OR side = 'sell')", (today,))
+                count = c.fetchone()[0]
+                return count
+        except Exception as e:
+            logging.error(f"Error getting today's trades: {e}")
+            return 0 # Return 0 in case of error to avoid blocking trading indefinitely
+
     # =============== Lectura de datos & indicadores ===============
     def get_data(self):
         try:
@@ -317,6 +330,13 @@ class TradingBot:
 
         while True:
             try:
+                # Check daily trade limit
+                daily_trades_count = self.get_today_trades()
+                if daily_trades_count >= 2:
+                    logging.info(f"Daily trade limit of 2 reached ({daily_trades_count} trades). Pausing activity.")
+                    time.sleep(300)  # Pause for 5 minutes before checking again
+                    continue
+
                 current_time = time.time()
                 # Respetamos el cooldown si hicimos un trade reciente
                 if self.last_trade_time and (current_time - self.last_trade_time) < self.cooldown_period:
