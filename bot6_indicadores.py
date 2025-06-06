@@ -125,15 +125,24 @@ def calculate_and_display_performance_metrics(trades_log, final_portfolio_value,
     print("--- End of Report ---")
 
 class TradingBot:
-    def __init__(self):
+    def __init__(self, loglevel_str='INFO'):
+        numeric_level = getattr(logging, loglevel_str.upper(), logging.INFO)
+        if not isinstance(numeric_level, int): # Should not happen with choices, but good fallback
+            print(f"Warning: Invalid log level string '{loglevel_str}'. Defaulting to INFO.")
+            numeric_level = logging.INFO
+
         logging.basicConfig(
-            level=logging.INFO,
+            level=numeric_level,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('trading_bot.log'),
                 logging.StreamHandler()
-            ]
+            ],
+            force=True # Requires Python 3.8+
         )
+        # Ensure other loggers (like Binance client) also respect this level if they are configured separately
+        # For now, basicConfig with force=True should handle the root logger well.
+
         load_dotenv('.env')
         
         # ====== Telegram ======
@@ -178,6 +187,7 @@ class TradingBot:
         self.initial_value = 0
         self.last_trade_time = None
         self.cooldown_period = 300  # 5 minutos (en segundos)
+        self.indicator_warmup_period = 50 # Default warmup period for indicators like SMA50
 
     def _interval_to_milliseconds(self, interval_str: str) -> int:
         seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
@@ -307,60 +317,86 @@ class TradingBot:
     # =============== Detección de señal ===============
     def detect_signal(self, df: pd.DataFrame):
         """Devuelve 'buy', 'sell' o None."""
-        if df is None or len(df) < 51:
-            return None  # Se requiere historial suficiente
-        if len(df) < 2:
-            return None  # Necesitamos al menos 2 velas para comparación
+        if df is None or len(df) < 51: # 50 for SMA50 + 1 for diffs/calcs if any indicator needs more than just close
+            logging.debug("Not enough data points to detect signal.")
+            return None
+        if len(df) < 2: # Need at least two rows for prev/last comparison
+            logging.debug("Not enough rows for prev/last comparison in detect_signal.")
+            return None
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
+
+        # Determine the correct timestamp to log based on DataFrame structure
+        # In backtesting, df.index is DatetimeIndex, so last.name is the timestamp.
+        # In live data, 'open_time' column holds the timestamp.
+        timestamp_to_log = last.name if isinstance(df.index, pd.DatetimeIndex) else last.get('open_time', 'N/A')
+
+        logging.debug(f"Detecting signal for timestamp: {timestamp_to_log}")
+        logging.debug(f"  Last Close: {last.get('close', float('nan')):.2f}")
+        logging.debug(f"  RSI: {last.get('RSI', float('nan')):.2f}")
+        logging.debug(f"  CCI: {last.get('CCI', float('nan')):.2f}")
+        logging.debug(f"  EMA9: {last.get('EMA9', float('nan')):.4f}, EMA21: {last.get('EMA21', float('nan')):.4f}")
+        logging.debug(f"  SMA10: {last.get('SMA10', float('nan')):.4f}, SMA50: {last.get('SMA50', float('nan')):.4f}")
+        logging.debug(f"  Prev EMA9: {prev.get('EMA9', float('nan')):.4f}, Prev EMA21: {prev.get('EMA21', float('nan')):.4f}")
+        logging.debug(f"  Prev SMA10: {prev.get('SMA10', float('nan')):.4f}, Prev SMA50: {prev.get('SMA50', float('nan')):.4f}")
+
         votes = []
 
-        # RSI
-        if last['RSI'] < 45:
-            votes.append('Buy')
-        elif last['RSI'] > 57:
-            votes.append('Sell')
-        else:
-            votes.append('Neutral')
+        # RSI Vote
+        rsi_vote = 'Neutral'
+        # Ensure RSI is not NaN before comparison
+        if pd.notna(last.get('RSI')):
+            if last['RSI'] < 45:
+                rsi_vote = 'Buy'
+            elif last['RSI'] > 57:
+                rsi_vote = 'Sell'
+        votes.append(rsi_vote)
+        logging.debug(f"  RSI Vote: {rsi_vote} (Value: {last.get('RSI', float('nan')):.2f})")
 
-        # CCI
-        if last['CCI'] < -20:
-            votes.append('Buy')
-        elif last['CCI'] > 20:
-            votes.append('Sell')
-        else:
-            votes.append('Neutral')
+        # CCI Vote
+        cci_vote = 'Neutral'
+        if pd.notna(last.get('CCI')):
+            if last['CCI'] < -20:
+                cci_vote = 'Buy'
+            elif last['CCI'] > 20:
+                cci_vote = 'Sell'
+        votes.append(cci_vote)
+        logging.debug(f"  CCI Vote: {cci_vote} (Value: {last.get('CCI', float('nan')):.2f})")
 
-        # Cruce EMA9 & EMA21
-        if prev['EMA9'] <= prev['EMA21'] and last['EMA9'] > last['EMA21']:
-            votes.append('Buy')
-        elif prev['EMA9'] >= prev['EMA21'] and last['EMA9'] < last['EMA21']:
-            votes.append('Sell')
-        else:
-            votes.append('Neutral')
+        # EMA Crossover Vote
+        ema_vote = 'Neutral'
+        if pd.notna(prev.get('EMA9')) and pd.notna(prev.get('EMA21')) and pd.notna(last.get('EMA9')) and pd.notna(last.get('EMA21')):
+            if prev['EMA9'] <= prev['EMA21'] and last['EMA9'] > last['EMA21']:
+                ema_vote = 'Buy'
+            elif prev['EMA9'] >= prev['EMA21'] and last['EMA9'] < last['EMA21']:
+                ema_vote = 'Sell'
+        votes.append(ema_vote)
+        logging.debug(f"  EMA Crossover Vote: {ema_vote} (Prev_EMA9: {prev.get('EMA9', float('nan')):.4f}, Prev_EMA21: {prev.get('EMA21', float('nan')):.4f}, Curr_EMA9: {last.get('EMA9', float('nan')):.4f}, Curr_EMA21: {last.get('EMA21', float('nan')):.4f})")
 
-        # Cruce SMA10 & SMA50
-        if (pd.notna(prev['SMA10']) and pd.notna(prev['SMA50']) and 
-            pd.notna(last['SMA10']) and pd.notna(last['SMA50'])):
+        # SMA Crossover Vote
+        sma_vote = 'Neutral'
+        if (pd.notna(prev.get('SMA10')) and pd.notna(prev.get('SMA50')) and
+            pd.notna(last.get('SMA10')) and pd.notna(last.get('SMA50')))):
             if prev['SMA10'] <= prev['SMA50'] and last['SMA10'] > last['SMA50']:
-                votes.append('Buy')
+                sma_vote = 'Buy'
             elif prev['SMA10'] >= prev['SMA50'] and last['SMA10'] < last['SMA50']:
-                votes.append('Sell')
-            else:
-                votes.append('Neutral')
-        else:
-            votes.append('Neutral')
+                sma_vote = 'Sell'
+        votes.append(sma_vote)
+        logging.debug(f"  SMA Crossover Vote: {sma_vote} (Prev_SMA10: {prev.get('SMA10', float('nan')):.4f}, Prev_SMA50: {prev.get('SMA50', float('nan')):.4f}, Curr_SMA10: {last.get('SMA10', float('nan')):.4f}, Curr_SMA50: {last.get('SMA50', float('nan')):.4f})")
 
         buy_count = sum(v == 'Buy' for v in votes)
         sell_count = sum(v == 'Sell' for v in votes)
 
+        final_signal = None
         if buy_count > sell_count:
-            return 'buy'
+            final_signal = 'buy'
         elif sell_count > buy_count:
-            return 'sell'
-        else:
-            return None
+            final_signal = 'sell'
+
+        logging.debug(f"  Vote Counts - Buy: {buy_count}, Sell: {sell_count}, Neutral: {len(votes) - buy_count - sell_count}")
+        logging.debug(f"  Final Signal for {timestamp_to_log}: {final_signal}")
+        return final_signal
 
     # =============== Órdenes y balances ===============
     def get_balance(self, asset: str) -> float:
@@ -711,7 +747,7 @@ class TradingBot:
         # Update log message to reflect filtering
         logging.info(f"Using {len(historical_df)} historical klines for {self.SYMBOL} (after date filtering if any)")
 
-        indicator_warmup_period = 50 # Should match the longest period in calculate_indicators (e.g. SMA50)
+        # indicator_warmup_period is now self.indicator_warmup_period, set in __init__
 
         for i, current_kline_series in historical_df.iterrows():
             current_kline = current_kline_series.to_dict() # Convert row to dict for easier access
@@ -729,24 +765,21 @@ class TradingBot:
                 sell_price_sl_tp = 0
                 sl_tp_type = ""
 
-                # Check Stop Loss: if current kline's low hits or goes below SL price
                 if self.stop_loss_price and current_kline['low'] <= self.stop_loss_price:
-                    sell_price_sl_tp = self.stop_loss_price # Execute at SL price
+                    sell_price_sl_tp = self.stop_loss_price
                     sl_tp_type = 'sell_sl'
                     triggered_sl_tp = True
                     logging.info(f"{current_timestamp}: Stop-loss triggered at {sell_price_sl_tp:.2f}")
-                # Check Take Profit: if current kline's high hits or goes above TP price
                 elif self.take_profit_price and current_kline['high'] >= self.take_profit_price:
-                    sell_price_sl_tp = self.take_profit_price # Execute at TP price
+                    sell_price_sl_tp = self.take_profit_price
                     sl_tp_type = 'sell_tp'
                     triggered_sl_tp = True
                     logging.info(f"{current_timestamp}: Take-profit triggered at {sell_price_sl_tp:.2f}")
 
                 if triggered_sl_tp:
-                    # Closing a position counts towards daily trade limit
-                    if trades_today >= 2 and sl_tp_type:
-                        logging.warning(f"{current_timestamp}: SL/TP for {sl_tp_type} would execute, but daily limit of 2 trades already met for {current_date_str}. Position remains open.")
-                        pass # Allow SL/TP to proceed, it will increment trades_today.
+                    if trades_today >= 2:
+                        # Log that SL/TP is executing despite daily trade limit for new trades.
+                        logging.debug(f"Backtest: {sl_tp_type.upper()} executing for {self.SYMBOL} at {sell_price_sl_tp:.2f} on {current_timestamp}, though daily new trade limit of 2 was met. This is a closing trade.")
 
                     quantity_to_sell = self.asset_balance
                     gross_proceeds = quantity_to_sell * sell_price_sl_tp
@@ -754,19 +787,19 @@ class TradingBot:
                     net_proceeds = gross_proceeds - commission
 
                     entry_cost_of_assets_sold = self.entry_price * quantity_to_sell if self.entry_price else 0
-                    pnl = net_proceeds - entry_cost_of_assets_sold
+                    pnl_trade = net_proceeds - entry_cost_of_assets_sold # Renamed pnl to pnl_trade for clarity
 
                     self.usdt_balance += net_proceeds
                     self.trades_log.append({
                         'timestamp': current_timestamp, 'type': sl_tp_type,
                         'price': sell_price_sl_tp, 'quantity': quantity_to_sell,
-                        'commission': commission, 'pnl': pnl,
+                        'commission': commission, 'pnl': pnl_trade,
                         'usdt_balance': self.usdt_balance
                     })
-                    logging.info(f"SL/TP Trade: {sl_tp_type.upper()} {quantity_to_sell} {self.SYMBOL} at {sell_price_sl_tp:.2f}, P&L: {pnl:.2f}, Commission: {commission:.2f}")
+                    logging.info(f"SL/TP Trade: {sl_tp_type.upper()} {quantity_to_sell} {self.SYMBOL} at {sell_price_sl_tp:.2f}, P&L: {pnl_trade:.2f}, Commission: {commission:.2f}")
+                    logging.debug(f"Backtest: {sl_tp_type.upper()} executed. Asset Balance: {0.0:.4f}, USDT Balance: {self.usdt_balance:.2f}, PNL for trade: {pnl_trade:.2f}")
 
-                    # Update portfolio value after SL/TP trade
-                    current_total_value_after_sl_tp = self.usdt_balance + (self.asset_balance * sell_price_sl_tp) # asset_balance is now 0
+                    current_total_value_after_sl_tp = self.usdt_balance # asset_balance is 0
                     self.portfolio_over_time.append({'timestamp': current_timestamp, 'value': current_total_value_after_sl_tp})
 
                     self.asset_balance = 0
@@ -775,13 +808,12 @@ class TradingBot:
                     self.stop_loss_price = None
                     self.take_profit_price = None
                     self.daily_trade_counts[current_date_str] = trades_today + 1
-                    continue # Skip further signal detection for this kline as position is closed
+                    continue
 
             # --- Indicator Calculation & Signal Detection ---
-            # current_market_price_for_kline is already defined as current_kline['close']
             current_loc = historical_df.index.get_loc(current_timestamp)
-            if current_loc < indicator_warmup_period: # Not enough data for reliable indicators yet
-                # Record portfolio value even if skipping indicators/trades
+            if current_loc < self.indicator_warmup_period:
+                logging.debug(f"Backtest step - Timestamp: {current_timestamp}, Skipping signal generation due to indicator warmup ({current_loc + 1}/{self.indicator_warmup_period} candles).")
                 current_total_value = self.usdt_balance + (self.asset_balance * current_market_price_for_kline)
                 self.portfolio_over_time.append({'timestamp': current_timestamp, 'value': current_total_value})
                 continue
@@ -794,9 +826,17 @@ class TradingBot:
                 continue
 
             signal = self.detect_signal(indicators_df)
-            trade_price = current_market_price_for_kline # Use close price of current kline for trade execution
+            logging.debug(f"Backtest step - Timestamp: {current_timestamp}, Signal: {signal}, Current Price: {current_market_price_for_kline:.2f}")
+
+            trade_price = current_market_price_for_kline
+
+            # Check daily trade limit for *new* trades
+            if trades_today >= 2 and signal is not None: # signal is not None implies a potential new trade
+                logging.debug(f"Backtest step - Timestamp: {current_timestamp}, Daily trade limit of 2 reached ({trades_today} trades). No new positions will be opened based on signal '{signal}'.")
+                # Fall through to portfolio value logging if no SL/TP occurred and no new trade is made
 
             # --- Buy Logic ---
+            # Condition trades_today < 2 is now checked above for any new signal-based trade.
             if signal == 'buy' and not self.in_position and trades_today < 2:
                 usdt_to_spend_for_buy = self.usdt_balance * 0.95 # Use 95% of available USDT balance
 
@@ -836,12 +876,13 @@ class TradingBot:
                         })
                         self.daily_trade_counts[current_date_str] = trades_today + 1
                         logging.info(f"{current_timestamp}: BUY {quantity_to_buy_asset:.4f} {self.SYMBOL} at {trade_price:.2f}, Cost: {net_cost_usdt_for_trade:.2f}, Commission: {commission_paid_usdt:.2f}")
+                        logging.debug(f"Backtest: BUY executed. Asset Balance: {self.asset_balance:.4f}, USDT Balance: {self.usdt_balance:.2f}, Entry: {self.entry_price:.2f}")
 
-                        # Update portfolio value after buy trade
                         current_total_value_after_buy = self.usdt_balance + (self.asset_balance * trade_price)
                         self.portfolio_over_time.append({'timestamp': current_timestamp, 'value': current_total_value_after_buy})
 
             # --- Sell Logic ---
+            # Condition trades_today < 2 is now checked above for any new signal-based trade.
             elif signal == 'sell' and self.in_position and trades_today < 2:
                 quantity_to_sell = self.asset_balance # Sell all current holdings
 
@@ -877,18 +918,19 @@ class TradingBot:
                     })
                     self.daily_trade_counts[current_date_str] = trades_today + 1
                     logging.info(f"{current_timestamp}: SELL {quantity_to_sell:.4f} {self.SYMBOL} at {trade_price:.2f}, Proceeds: {net_proceeds:.2f}, Commission: {commission_paid_usdt_sell:.2f}, P&L: {pnl_trade:.2f}")
+                    logging.debug(f"Backtest: SELL executed. Asset Balance: {self.asset_balance:.4f}, USDT Balance: {self.usdt_balance:.2f}, PNL for trade: {pnl_trade:.2f}")
 
-                    # Update portfolio value after sell trade
-                    current_total_value_after_sell = self.usdt_balance + (self.asset_balance * trade_price) # asset_balance is now 0
+                    current_total_value_after_sell = self.usdt_balance # asset_balance is 0
                     self.portfolio_over_time.append({'timestamp': current_timestamp, 'value': current_total_value_after_sell})
 
-            else: # No trade occurred in this kline based on signal
-                # Still record portfolio value at the end of this kline if no trade happened
-                # Check if portfolio_over_time was already updated by SL/TP, Buy, or Sell logic for this timestamp
-                # This 'else' branch might lead to duplicate entries if not careful.
-                # A better way is to ensure one update per kline at the end, unless a trade has just updated it.
-                # Let's ensure it's only appended if no trade happened in this iteration for this timestamp.
-                # A simple check: if the last timestamp in portfolio_over_time is not current_timestamp
+            else:
+                # This 'else' covers:
+                # 1. No signal (signal is None)
+                # 2. Signal to buy, but already in position
+                # 3. Signal to sell, but not in position
+                # 4. Signal occurred, but daily trade limit for new trades was reached.
+                # In all these cases, no new trade action is taken based on the signal.
+                # We need to log portfolio value if it wasn't already logged by a trade action this kline.
                 if not self.portfolio_over_time or self.portfolio_over_time[-1]['timestamp'] != current_timestamp:
                     current_total_value = self.usdt_balance + (self.asset_balance * current_market_price_for_kline)
                     self.portfolio_over_time.append({'timestamp': current_timestamp, 'value': current_total_value})
@@ -927,13 +969,20 @@ if __name__ == "__main__":
     parser.add_argument('--start-date', type=str, help='Start date for data fetching or backtesting (YYYY-MM-DD).')
     parser.add_argument('--end-date', type=str, help='End date for data fetching or backtesting (YYYY-MM-DD).')
 
+    parser.add_argument(
+        '--loglevel',
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        help='Set the logging level (default: INFO)'
+    )
+
     args = parser.parse_args()
 
     # Instantiate the bot here if it's needed for all modes or if its __init__ is light.
     # Logging is configured in TradingBot's __init__.
     # If fetch_data is used, we might not need a full bot instance always,
     # but given fetch_and_save_historical_data is a method, we need an instance.
-    bot = TradingBot()
+    bot = TradingBot(loglevel_str=args.loglevel)
 
     if args.fetch_data:
         required_for_fetch = ['output_csv', 'start_date', 'end_date', 'interval']
