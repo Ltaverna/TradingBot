@@ -179,6 +179,19 @@ class TradingBot:
         self.last_trade_time = None
         self.cooldown_period = 300  # 5 minutos (en segundos)
 
+    def _interval_to_milliseconds(self, interval_str: str) -> int:
+        seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+        unit = interval_str[-1]
+        value_str = interval_str[:-1]
+
+        if not value_str.isdigit():
+            raise ValueError(f"Invalid interval format: {interval_str}. Expected format like '1m', '5h'.")
+        value = int(value_str)
+
+        if unit not in seconds_per_unit:
+            raise ValueError(f"Invalid interval unit: {unit}. Supported units: s, m, h, d, w.")
+        return value * seconds_per_unit[unit] * 1000
+
     # =============== Notificaciones & DB ===============
     def notify_telegram(self, message: str):
         with self.lock:
@@ -556,6 +569,102 @@ class TradingBot:
         self.stop_loss_price = None
         self.take_profit_price = None
 
+    def fetch_and_save_historical_data(self, symbol: str, start_date_str: str, end_date_str: str, interval: str, filepath: str):
+        # Ensure datetime.time is imported as dt_time or similar if used like that.
+        # from datetime import time as dt_time (at the top of the file)
+        # For this method, we can directly use datetime.min.time() etc.
+        from datetime import time as dt_time # Local import for clarity or ensure it's at file top
+
+        try:
+            start_dt_obj = datetime.strptime(start_date_str, '%Y-%m-%d')
+            original_start_ms = int(datetime.combine(start_dt_obj, dt_time.min).timestamp() * 1000)
+
+            end_dt_obj = datetime.strptime(end_date_str, '%Y-%m-%d')
+            target_end_ms = int(datetime.combine(end_dt_obj, dt_time.max).timestamp() * 1000)
+        except ValueError as e:
+            logging.error(f"Invalid date format for start/end date: {e}. Please use YYYY-MM-DD.")
+            return
+
+        current_fetch_start_ms = original_start_ms
+
+        kline_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume',
+                         'close_time', 'quote_asset_volume', 'number_of_trades',
+                         'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore']
+
+        all_fetched_klines = []
+        logging.info(f"Fetching historical data for {symbol} from {start_date_str} to {end_date_str} with interval {interval}.")
+
+        while current_fetch_start_ms <= target_end_ms:
+            try:
+                # Binance API get_historical_klines uses start_str and optionally end_str or limit
+                # We use start_str and limit to paginate, and will filter by target_end_ms later if needed
+                # The API's endTime parameter is inclusive for the kline's open time.
+                klines = self.client.get_historical_klines(
+                    symbol,
+                    interval,
+                    str(current_fetch_start_ms), # API expects string for timestamp
+                    # endTime=str(target_end_ms), # Let pagination handle end, filter later for precision
+                    limit=1000
+                )
+            except Exception as e:
+                logging.error(f"Error fetching klines: {e}", exc_info=True)
+                break
+
+            if not klines:
+                logging.info("No more klines returned from API or reached end of data for the period.")
+                break
+
+            all_fetched_klines.extend(klines)
+            last_kline_open_time = klines[-1][0] # This is int (ms), open time of the last kline
+
+            # Check if the last fetched kline is beyond our target end time.
+            if last_kline_open_time > target_end_ms:
+                logging.info(f"Last fetched kline at {datetime.fromtimestamp(last_kline_open_time/1000)} is beyond target end {end_date_str}. Stopping.")
+                break
+
+            try:
+                # Advance to the start of the next interval after the last fetched kline's open time
+                current_fetch_start_ms = last_kline_open_time + self._interval_to_milliseconds(interval)
+            except ValueError as e:
+                logging.error(f"Could not calculate next fetch start time due to interval error: {e}")
+                break
+
+            if current_fetch_start_ms <= last_kline_open_time :
+                logging.error("Interval calculation resulted in non-positive advancement or stuck. Halting fetch.")
+                break
+
+            logging.info(f"Fetched {len(klines)} klines up to {datetime.fromtimestamp(last_kline_open_time/1000)}. Next fetch starts at: {datetime.fromtimestamp(current_fetch_start_ms/1000)}")
+            time.sleep(0.2) # Respect API rate limits
+
+        if not all_fetched_klines:
+            logging.warning("No klines fetched. CSV file will not be created.")
+            return
+
+        df = pd.DataFrame(all_fetched_klines, columns=kline_columns)
+        # Ensure timestamp is numeric for filtering
+        df['timestamp'] = pd.to_numeric(df['timestamp'])
+
+        # Filter strictly within the originally requested day boundaries
+        df = df[(df['timestamp'] >= original_start_ms) & (df['timestamp'] <= target_end_ms)]
+
+        if df.empty:
+            logging.warning(f"No klines remaining after final date filtering for range {start_date_str} to {end_date_str}. CSV file will not be created.")
+            return
+
+        # Select and save only the required columns
+        df_to_save = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy()
+        for col in ['open', 'high', 'low', 'close', 'volume']: # Ensure these are numeric
+            df_to_save[col] = pd.to_numeric(df_to_save[col], errors='coerce')
+
+        # Drop rows with NaN that might have been coerced if source data was bad
+        df_to_save.dropna(inplace=True)
+
+        try:
+            df_to_save.to_csv(filepath, index=False)
+            logging.info(f"Successfully fetched {len(df_to_save)} klines and saved to {filepath}")
+        except Exception as e:
+            logging.error(f"Error saving data to CSV {filepath}: {e}", exc_info=True)
+
     def run_backtest(self, historical_data_filepath: str, initial_usdt_balance: float, commission_rate: float, start_date_str: str = None, end_date_str: str = None):
         # Initialization for backtesting state
         self.usdt_balance = initial_usdt_balance
@@ -808,18 +917,60 @@ if __name__ == "__main__":
     parser.add_argument("--data-file", type=str, default="historical_data.csv", help="Path to historical data CSV file for backtesting.")
     parser.add_argument("--initial-balance", type=float, default=1000.0, help="Initial USDT balance for backtesting.")
     parser.add_argument("--commission-rate", type=float, default=0.001, help="Commission rate for trades (e.g., 0.001 for 0.1%).")
-    parser.add_argument("--start-date", type=str, default=None, help="Start date for backtesting (YYYY-MM-DD).")
-    parser.add_argument("--end-date", type=str, default=None, help="End date for backtesting (YYYY-MM-DD).")
+
+    # Arguments for data fetching
+    parser.add_argument('--fetch-data', type=str, help='Symbol to fetch data for (e.g., XRPUSDT). Triggers data fetching mode.')
+    parser.add_argument('--output-csv', type=str, help='Filepath to save the fetched CSV data.')
+    parser.add_argument('--interval', type=str, help="Interval for k-lines (e.g., '1m', '5m', '1h', '1d').")
+
+    # Date arguments used by both backtesting and data fetching
+    parser.add_argument('--start-date', type=str, help='Start date for data fetching or backtesting (YYYY-MM-DD).')
+    parser.add_argument('--end-date', type=str, help='End date for data fetching or backtesting (YYYY-MM-DD).')
 
     args = parser.parse_args()
 
+    # Instantiate the bot here if it's needed for all modes or if its __init__ is light.
+    # Logging is configured in TradingBot's __init__.
+    # If fetch_data is used, we might not need a full bot instance always,
+    # but given fetch_and_save_historical_data is a method, we need an instance.
     bot = TradingBot()
 
-    if args.backtest:
+    if args.fetch_data:
+        required_for_fetch = ['output_csv', 'start_date', 'end_date', 'interval']
+        missing_args = [arg_name for arg_name in required_for_fetch if not getattr(args, arg_name)]
+        if missing_args:
+            # Construct the error message for parser.error
+            missing_args_str = ', '.join([f"--{arg.replace('_', '-')}" for arg in missing_args])
+            parser.error(f"--fetch-data requires --output-csv, --start-date, --end-date, and --interval. Missing: {missing_args_str}")
+
+        # All required arguments for fetching are present
+        logging.info(f"Data fetching mode activated for symbol: {args.fetch_data} from {args.start_date} to {args.end_date} with interval {args.interval}, output to {args.output_csv}")
+        try:
+            bot.fetch_and_save_historical_data(
+                symbol=args.fetch_data,
+                start_date_str=args.start_date,
+                end_date_str=args.end_date,
+                interval=args.interval,
+                filepath=args.output_csv
+            )
+            logging.info("Data fetching process completed.")
+        except Exception as e:
+            logging.error(f"An error occurred during data fetching: {e}", exc_info=True)
+            print(f"An error occurred during data fetching: {e}") # Also print to console for immediate feedback
+            # Decide on exit code based on error, or just exit.
+            # exit(1) # Optionally indicate error with exit code
+        # Script should terminate after attempting data fetching.
+        # If no exit(1) above, it will fall through and exit(0) effectively.
+
+    elif args.backtest:
+        # Validate backtesting-specific required arguments
+        if not args.data_file:
+             parser.error("--backtest mode requires --data-file.")
+
         if not os.path.exists(args.data_file):
             print(f"Error: Historical data file not found: {args.data_file}")
             logging.error(f"Historical data file not found: {args.data_file}")
-            # Consider exiting or handling this more gracefully
+            # exit(1) # Exit with an error code
         else:
             print(f"Running in backtest mode with data from: {args.data_file}")
             logging.info(f"Starting backtest mode. Data: {args.data_file}, Initial Balance: {args.initial_balance}, Commission: {args.commission_rate}, StartDate: {args.start_date}, EndDate: {args.end_date}")
@@ -832,18 +983,14 @@ if __name__ == "__main__":
                 end_date_str=args.end_date
             )
 
-            # Call the new function to display detailed metrics
             calculate_and_display_performance_metrics(
                 trades_log,
                 final_value,
                 initial_value,
                 portfolio_over_time,
-                args.commission_rate # Pass the commission rate from args
+                args.commission_rate
             )
-
-            # The old summary print statements are now covered by calculate_and_display_performance_metrics
-            # So, they can be removed if they were separate. The prompt implies replacing them.
-            logging.info("Backtest finished.") # Keep general log message
+            logging.info("Backtest finished.")
 
     else:
         # Live trading mode (original main execution)
